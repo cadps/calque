@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Calque AR</title>
+<style>
+  :root{--bg:rgba(15,15,18,.78);--fg:#f2f2f2;--acc:#4fc3f7;--warn:#ffb74d}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;background:#000;color:var(--fg);font:14px/1.3 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
+  #video{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;background:#000}
+  #stage{position:fixed;inset:0;overflow:hidden;touch-action:none}
+  #layer{position:absolute;left:50%;top:50%;transform-origin:0 0;will-change:transform;pointer-events:none}
+  #layer img{display:block;max-width:none;pointer-events:none}
+  #ui{position:fixed;left:0;right:0;bottom:0;padding:10px 10px calc(10px + env(safe-area-inset-bottom));background:var(--bg);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);transition:transform .25s}
+  #ui.hidden{transform:translateY(110%)}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
+  .row:first-child{margin-top:0}
+  button,label.btn{flex:1 1 auto;min-width:64px;padding:10px 8px;border:1px solid #555;border-radius:10px;background:#222;color:var(--fg);font-size:13px;text-align:center;cursor:pointer}
+  button.on{background:var(--acc);color:#000;border-color:var(--acc)}
+  button.lock.on{background:var(--warn);border-color:var(--warn)}
+  input[type=range]{flex:1;accent-color:var(--acc);height:28px}
+  .lbl{min-width:84px;font-size:12px;opacity:.85}
+  .val{min-width:38px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
+  #show{position:fixed;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));display:none;width:48px;height:48px;border-radius:50%;padding:0;min-width:0;background:var(--bg);font-size:20px}
+  #msg{position:fixed;top:calc(12px + env(safe-area-inset-top));left:50%;transform:translateX(-50%);background:var(--bg);padding:8px 14px;border-radius:10px;font-size:13px;max-width:92%;text-align:center;display:none;z-index:5}
+  #start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:#111;z-index:10;padding:24px;text-align:center}
+  #start button{flex:none;padding:14px 28px;font-size:16px;background:var(--acc);color:#000;border:none}
+  #start p{max-width:420px;opacity:.8;margin:0}
+  input[type=file]{display:none}
+</style>
+</head>
+<body>
+<video id="video" playsinline autoplay muted></video>
+<div id="stage"><div id="layer"><img id="img" alt=""></div></div>
+
+<div id="msg"></div>
+
+<div id="ui">
+  <div class="row">
+    <label class="btn" for="file">🖼 Image</label>
+    <button id="lock" class="lock">🔓 Libre</button>
+    <button id="mode">✏️ Contours</button>
+    <button id="hide">▾ Masquer</button>
+  </div>
+  <div class="row">
+    <span class="lbl">Opacité</span>
+    <input id="opacity" type="range" min="0" max="100" value="50">
+    <span class="val" id="opv">50%</span>
+  </div>
+  <div class="row" id="thrRow" style="display:none">
+    <span class="lbl">Seuil contours</span>
+    <input id="thr" type="range" min="5" max="200" value="40">
+    <span class="val" id="thrv">40</span>
+  </div>
+  <div class="row">
+    <button id="flip">⇋ Miroir</button>
+    <button id="gray">◐ N&amp;B</button>
+    <button id="reset">⟲ Recentrer</button>
+    <button id="torch">🔦 Flash</button>
+    <button id="cam">📷 Caméra</button>
+  </div>
+</div>
+<button id="show">▴</button>
+<input id="file" type="file" accept="image/*">
+
+<div id="start">
+  <h2 style="margin:0">Calque AR</h2>
+  <p>Fixe le téléphone au-dessus de la feuille (support, verre, pile de livres). Charge une image, règle position / taille / opacité, puis verrouille et dessine en regardant l'écran.</p>
+  <button id="go">Activer la caméra</button>
+  <p id="err" style="color:#ff8a80"></p>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const video = $('video'), stage = $('stage'), layer = $('layer'), img = $('img');
+  const msgEl = $('msg');
+  let stream = null, track = null, facing = 'environment', torchOn = false, wakeLock = null;
+  let srcURL = null, edgeURL = null, edgeMode = false, srcBitmap = null;
+  // Transform state
+  const T = { x: 0, y: 0, s: 1, r: 0, flip: 1 };
+  let locked = false;
+
+  function toast(t, ms = 1800) {
+    msgEl.textContent = t; msgEl.style.display = 'block';
+    clearTimeout(toast._t); toast._t = setTimeout(() => msgEl.style.display = 'none', ms);
+  }
+  function apply() {
+    const w = img.naturalWidth || 0, h = img.naturalHeight || 0;
+    layer.style.transform =
+      `translate(${T.x}px,${T.y}px) rotate(${T.r}rad) scale(${T.s * T.flip},${T.s}) translate(${-w/2}px,${-h/2}px)`;
+  }
+
+  // ---------- Caméra ----------
+  async function startCam() {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('getUserMedia indisponible (page non HTTPS ?)');
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+    });
+    video.srcObject = stream;
+    await video.play().catch(() => {});
+    track = stream.getVideoTracks()[0];
+    torchOn = false; $('torch').classList.remove('on');
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    $('torch').style.display = caps.torch ? '' : 'none';
+    // Mise au point continue si dispo
+    try {
+      if (caps.focusMode && caps.focusMode.includes('continuous'))
+        await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+    } catch (e) {}
+  }
+  async function keepAwake() {
+    try {
+      if ('wakeLock' in navigator) {
+        wakeLock = await navigator.wakeLock.request('screen');
+      }
+    } catch (e) {}
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      keepAwake();
+      if (track && track.readyState === 'ended') startCam().catch(()=>{});
+    }
+  });
+
+  $('go').onclick = async () => {
+    try {
+      await startCam();
+      await keepAwake();
+      $('start').style.display = 'none';
+      toast('Charge une image avec 🖼');
+    } catch (e) {
+      $('err').textContent = 'Erreur caméra : ' + (e.message || e.name);
+    }
+  };
+  $('cam').onclick = async () => {
+    facing = facing === 'environment' ? 'user' : 'environment';
+    try { await startCam(); } catch (e) { toast('Impossible de changer de caméra'); }
+  };
+  $('torch').onclick = async () => {
+    if (!track) return;
+    try {
+      torchOn = !torchOn;
+      await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+      $('torch').classList.toggle('on', torchOn);
+    } catch (e) { torchOn = false; toast('Flash non supporté'); }
+  };
+
+  // ---------- Image ----------
+  $('file').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    if (srcURL) URL.revokeObjectURL(srcURL);
+    if (edgeURL) { URL.revokeObjectURL(edgeURL); edgeURL = null; }
+    srcURL = URL.createObjectURL(f);
+    srcBitmap = null;
+    edgeMode = false; $('mode').classList.remove('on'); $('thrRow').style.display = 'none';
+    img.onload = () => { fitImage(); };
+    img.src = srcURL;
+    e.target.value = '';
+  };
+  function fitImage() {
+    const w = img.naturalWidth, h = img.naturalHeight;
+    const sw = innerWidth, sh = innerHeight;
+    T.x = 0; T.y = -sh * 0.08; T.r = 0;
+    T.s = Math.min(sw * 0.9 / w, sh * 0.7 / h);
+    apply();
+  }
+  $('reset').onclick = () => { if (img.naturalWidth) fitImage(); };
+
+  // ---------- Opacité / filtres ----------
+  const op = $('opacity');
+  function setOpacity() { img.style.opacity = op.value / 100; $('opv').textContent = op.value + '%'; }
+  op.oninput = setOpacity; setOpacity();
+
+  let gray = false;
+  $('gray').onclick = () => {
+    gray = !gray; $('gray').classList.toggle('on', gray);
+    img.style.filter = gray ? 'grayscale(1) contrast(1.4)' : '';
+  };
+  $('flip').onclick = () => { T.flip *= -1; $('flip').classList.toggle('on', T.flip < 0); apply(); };
+
+  // ---------- Contours (Sobel) ----------
+  async function buildEdges() {
+    if (!srcURL) return;
+    if (!srcBitmap) {
+      const tmp = new Image(); tmp.src = srcURL; await tmp.decode();
+      srcBitmap = tmp;
+    }
+    const max = 1600;
+    let w = srcBitmap.naturalWidth, h = srcBitmap.naturalHeight;
+    const k = Math.min(1, max / Math.max(w, h));
+    w = Math.round(w * k); h = Math.round(h * k);
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(srcBitmap, 0, 0, w, h);
+    const d = ctx.getImageData(0, 0, w, h), p = d.data;
+    const g = new Float32Array(w * h);
+    for (let i = 0, j = 0; i < p.length; i += 4, j++) g[j] = 0.299*p[i] + 0.587*p[i+1] + 0.114*p[i+2];
+    // flou 3x3 léger
+    const b = new Float32Array(w * h);
+    for (let y = 1; y < h-1; y++) for (let x = 1; x < w-1; x++) {
+      const i = y*w + x;
+      b[i] = (g[i-w-1] + 2*g[i-w] + g[i-w+1] + 2*g[i-1] + 4*g[i] + 2*g[i+1] + g[i+w-1] + 2*g[i+w] + g[i+w+1]) / 16;
+    }
+    const thr = +$('thr').value;
+    const out = ctx.createImageData(w, h), o = out.data;
+    for (let y = 1; y < h-1; y++) for (let x = 1; x < w-1; x++) {
+      const i = y*w + x;
+      const gx = -b[i-w-1] - 2*b[i-1] - b[i+w-1] + b[i-w+1] + 2*b[i+1] + b[i+w+1];
+      const gy = -b[i-w-1] - 2*b[i-w] - b[i-w+1] + b[i+w-1] + 2*b[i+w] + b[i+w+1];
+      const m = Math.hypot(gx, gy);
+      if (m > thr) { const q = i*4; o[q] = 0; o[q+1] = 0; o[q+2] = 0; o[q+3] = Math.min(255, (m - thr) * 3 + 120); }
+    }
+    ctx.putImageData(out, 0, 0);
+    const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+    if (edgeURL) URL.revokeObjectURL(edgeURL);
+    edgeURL = URL.createObjectURL(blob);
+    // conserver l'échelle visuelle : l'image contours peut être réduite
+    const prevW = img.naturalWidth;
+    await new Promise(res => { img.onload = res; img.src = edgeURL; });
+    T.s *= prevW / img.naturalWidth; apply();
+  }
+  let thrTimer;
+  $('thr').oninput = () => {
+    $('thrv').textContent = $('thr').value;
+    clearTimeout(thrTimer); thrTimer = setTimeout(() => edgeMode && buildEdges(), 150);
+  };
+  $('mode').onclick = async () => {
+    if (!srcURL) { toast('Charge d\'abord une image'); return; }
+    edgeMode = !edgeMode;
+    $('mode').classList.toggle('on', edgeMode);
+    $('thrRow').style.display = edgeMode ? '' : 'none';
+    if (edgeMode) { toast('Calcul des contours…', 900); await buildEdges(); }
+    else {
+      const prevW = img.naturalWidth;
+      await new Promise(res => { img.onload = res; img.src = srcURL; });
+      T.s *= prevW / img.naturalWidth; apply();
+    }
+  };
+
+  // ---------- Verrou / UI ----------
+  $('lock').onclick = () => {
+    locked = !locked;
+    $('lock').classList.toggle('on', locked);
+    $('lock').textContent = locked ? '🔒 Verrouillé' : '🔓 Libre';
+  };
+  $('hide').onclick = () => { $('ui').classList.add('hidden'); $('show').style.display = 'block'; };
+  $('show').onclick = () => { $('ui').classList.remove('hidden'); $('show').style.display = 'none'; };
+
+  // ---------- Gestes : 1 doigt = déplacer, 2 doigts = zoom + rotation ----------
+  const pts = new Map();
+  let g0 = null;
+  function snapshot() {
+    const a = [...pts.values()];
+    if (a.length === 1) return { n: 1, x: a[0].x, y: a[0].y };
+    const [p, q] = a;
+    return { n: 2, x: (p.x+q.x)/2, y: (p.y+q.y)/2, d: Math.hypot(q.x-p.x, q.y-p.y), a: Math.atan2(q.y-p.y, q.x-p.x) };
+  }
+  stage.addEventListener('pointerdown', e => {
+    if (locked || !img.naturalWidth) return;
+    stage.setPointerCapture(e.pointerId);
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    g0 = pts.size <= 2 ? snapshot() : g0;
+  });
+  stage.addEventListener('pointermove', e => {
+    if (!pts.has(e.pointerId) || locked) return;
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pts.size > 2) return;
+    const g = snapshot();
+    if (!g0 || g.n !== g0.n) { g0 = g; return; }
+    T.x += g.x - g0.x; T.y += g.y - g0.y;
+    if (g.n === 2 && g0.d > 0) {
+      const k = g.d / g0.d;
+      // zoom/rotation autour du centre des doigts
+      const cx = g.x - innerWidth/2, cy = g.y - innerHeight/2;
+      const dr = g.a - g0.a;
+      const vx = T.x - cx, vy = T.y - cy;
+      const cos = Math.cos(dr), sin = Math.sin(dr);
+      T.x = cx + k * (vx*cos - vy*sin);
+      T.y = cy + k * (vx*sin + vy*cos);
+      T.s *= k; T.r += dr;
+    }
+    g0 = g; apply();
+  });
+  const end = e => { pts.delete(e.pointerId); g0 = pts.size ? snapshot() : null; };
+  stage.addEventListener('pointerup', end);
+  stage.addEventListener('pointercancel', end);
+  // Molette (desktop) = zoom
+  stage.addEventListener('wheel', e => {
+    if (locked || !img.naturalWidth) return;
+    e.preventDefault(); T.s *= Math.exp(-e.deltaY * 0.0015); apply();
+  }, { passive: false });
+
+  addEventListener('resize', apply);
+  if (!window.isSecureContext) $('err').textContent = 'Attention : la caméra exige HTTPS (ou localhost).';
+})();
+</script>
+</body>
+</html>
